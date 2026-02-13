@@ -18,13 +18,19 @@ class LiquifyEditor extends StatefulWidget {
 class _LiquifyEditorState extends State<LiquifyEditor> {
   ui.Image? _originalImage;
   ui.Image? _currentImage;
+  img.Image? _workingImage; // Keep in img.Image format for faster warping
   final List<LiquifyStroke> _strokes = [];
   Offset? _currentPosition;
   double _brushSize = 50.0;
   double _brushIntensity = 0.5;
-  bool _isProcessing = false;
-  double _scale = 1.0;
-  Offset _imageOffset = Offset.zero;
+  double _baseScale = 1.0; // Base scale to fit image to screen
+  double _zoomScale = 1.0; // User zoom level (pinch)
+  Offset _panOffset = Offset.zero; // Pan offset for zoomed image
+  Offset? _lastFocalPoint; // Last focal point for pinch gesture
+  Size? _gestureAreaSize; // Size of the gesture detector area
+  
+  // Mode selection: 'frame' for zoom/pan, 'liquify' for editing
+  String _currentMode = 'liquify'; // 'frame' or 'liquify'
 
   @override
   void initState() {
@@ -32,76 +38,156 @@ class _LiquifyEditorState extends State<LiquifyEditor> {
     _loadImage();
   }
 
+  // Step 1: Load Image into Image object
   Future<void> _loadImage() async {
     final codec = await ui.instantiateImageCodec(widget.imageBytes);
     final frame = await codec.getNextFrame();
+    
+    // Convert to img.Image format for warping operations
+    final imgData = await _uiImageToImage(frame.image);
+    
     setState(() {
       _originalImage = frame.image;
       _currentImage = frame.image;
+      _workingImage = imgData;
     });
   }
 
-  Offset _displayToImageCoordinates(Offset screenPos) {
-    // Convert screen coordinates to image coordinates
-    // The screenPos is relative to the Stack, we need to account for centering
-    final screenSize = MediaQuery.of(context).size;
+  Offset _displayToImageCoordinates(Offset localPos) {
+    if (_gestureAreaSize == null || _currentImage == null) {
+      return Offset.zero;
+    }
+    
     final imageSize = Size(_currentImage!.width.toDouble(), _currentImage!.height.toDouble());
-    final displaySize = Size(imageSize.width * _scale, imageSize.height * _scale);
+    final baseDisplaySize = Size(imageSize.width * _baseScale, imageSize.height * _baseScale);
 
-    // Calculate actual image position on screen (centered)
-    final imageLeft = (screenSize.width - displaySize.width) / 2;
-    final imageTop = ((screenSize.height - 200) - displaySize.height) / 2;
+    // GestureDetector localPos is relative to the GestureDetector widget (0,0 at top-left)
+    // CustomPaint is centered within the GestureDetector using Center widget
+    final centerX = _gestureAreaSize!.width / 2;
+    final centerY = _gestureAreaSize!.height / 2;
+    
+    // Account for pan offset and find where CustomPaint center is in GestureDetector coordinates
+    final paintCenterX = centerX + _panOffset.dx;
+    final paintCenterY = centerY + _panOffset.dy;
+    
+    // Convert GestureDetector local position to CustomPaint local coordinates
+    // The CustomPaint is scaled by _zoomScale, so we need to undo that
+    final localX = (localPos.dx - paintCenterX) / _zoomScale;
+    final localY = (localPos.dy - paintCenterY) / _zoomScale;
+    
+    // Convert from center-relative to top-left-relative coordinates
+    final paintX = localX + baseDisplaySize.width / 2;
+    final paintY = localY + baseDisplaySize.height / 2;
 
-    // Convert to image coordinates
-    final imageX = (screenPos.dx - imageLeft) / _scale;
-    final imageY = (screenPos.dy - imageTop) / _scale;
+    // Convert CustomPaint coordinates to image coordinates
+    final imageX = paintX / _baseScale;
+    final imageY = paintY / _baseScale;
 
     return Offset(imageX, imageY);
   }
 
-  void _onPanEnd(DragEndDetails details) {
-    setState(() {
-      _currentPosition = null;
-    });
+
+  // Step 3: Calculate Deformation based on brush size and distance from touch point
+  void _applyDeformation(Offset start, Offset end) {
+    if (_currentImage == null || _workingImage == null) return;
+
+    // Calculate warp factor based on brush size and distance
+    final strokeDistance = (end - start).distance;
+    if (strokeDistance < 1.0) return;
+
+    // Apply warp to working image
+    final warpedImage = _calculateWarp(
+      _workingImage!,
+      start,
+      end,
+      _brushSize,
+      _brushIntensity,
+    );
+
+    // Update working image
+    _workingImage = warpedImage;
+
+    // Step 4: Redraw Canvas - Convert back to UI Image and trigger repaint
+    _updateCanvasImage(warpedImage);
   }
 
-  Future<void> _applyLiquifyEffect(LiquifyStroke stroke) async {
-    if (_currentImage == null) return;
+  // Calculate warp deformation
+  img.Image _calculateWarp(
+    img.Image image,
+    Offset start,
+    Offset end,
+    double brushSize,
+    double intensity,
+  ) {
+    final width = image.width;
+    final height = image.height;
+    final output = img.Image.from(image);
 
-    setState(() {
-      _isProcessing = true;
-    });
+    // Calculate displacement vector
+    final dx = (end.dx - start.dx) * intensity;
+    final dy = (end.dy - start.dy) * intensity;
+    final distance = math.sqrt(dx * dx + dy * dy);
 
-    try {
-      // Convert UI Image to Image package format
-      final imageData = await _uiImageToImage(_currentImage!);
+    if (distance < 0.1) return output;
 
-      // Apply liquify warp (optimized to only process affected area)
-      final warpedImage = _applyWarp(
-        imageData,
-        stroke.start,
-        stroke.end,
-        stroke.brushSize,
-        stroke.intensity,
-      );
+    // Normalize direction
+    final dirX = dx / distance;
+    final dirY = dy / distance;
+    final brushRadius = brushSize / 2;
 
-      // Convert back to UI Image
-      final uiImage = await _imageToUiImage(warpedImage);
+    // Calculate affected region bounds
+    final minX = (math.min(start.dx, end.dx) - brushRadius).floor().clamp(0, width - 1);
+    final maxX = (math.max(start.dx, end.dx) + brushRadius).ceil().clamp(0, width - 1);
+    final minY = (math.min(start.dy, end.dy) - brushRadius).floor().clamp(0, height - 1);
+    final maxY = (math.max(start.dy, end.dy) + brushRadius).ceil().clamp(0, height - 1);
 
+    // Apply warp only to affected region
+    for (int y = minY; y <= maxY; y++) {
+      for (int x = minX; x <= maxX; x++) {
+        final pixelX = x.toDouble();
+        final pixelY = y.toDouble();
+
+        // Calculate distance from stroke line
+        final toStartX = pixelX - start.dx;
+        final toStartY = pixelY - start.dy;
+        final t = math.max(0.0, math.min(1.0, (toStartX * dirX + toStartY * dirY) / distance));
+        final projX = start.dx + t * dx;
+        final projY = start.dy + t * dy;
+
+        final distToLine = math.sqrt(
+          math.pow(pixelX - projX, 2) + math.pow(pixelY - projY, 2),
+        );
+
+        if (distToLine < brushRadius) {
+          // Calculate falloff based on distance from touch point
+          final falloff = 1.0 - (distToLine / brushRadius);
+          final strength = falloff * falloff * intensity;
+
+          // Calculate displacement
+          final displacementX = dirX * strength * brushRadius * 0.8;
+          final displacementY = dirY * strength * brushRadius * 0.8;
+
+          // Backward mapping
+          final srcX = (pixelX - displacementX).round().clamp(0, width - 1);
+          final srcY = (pixelY - displacementY).round().clamp(0, height - 1);
+
+          final pixel = image.getPixel(srcX, srcY);
+          output.setPixel(x, y, pixel);
+        }
+      }
+    }
+
+    return output;
+  }
+
+  // Update canvas image and trigger repaint
+  Future<void> _updateCanvasImage(img.Image warpedImage) async {
+    final uiImage = await _imageToUiImage(warpedImage);
+    
+    if (mounted) {
       setState(() {
         _currentImage = uiImage;
-        _strokes.add(stroke);
-        _isProcessing = false;
       });
-    } catch (e) {
-      setState(() {
-        _isProcessing = false;
-      });
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('Error applying effect: $e')),
-        );
-      }
     }
   }
 
@@ -118,96 +204,131 @@ class _LiquifyEditorState extends State<LiquifyEditor> {
     return frame.image;
   }
 
-  img.Image _applyWarp(
-      img.Image image,
-      Offset start,
-      Offset end,
-      double brushSize,
-      double intensity,
-      ) {
-    final width = image.width;
-    final height = image.height;
-
-    // Create output image by copying the current image
-    final output = img.Image.from(image);
-
-    // Calculate displacement vector
-    final dx = (end.dx - start.dx) * intensity;
-    final dy = (end.dy - start.dy) * intensity;
-    final distance = math.sqrt(dx * dx + dy * dy);
-
-    if (distance < 0.1) return output;
-
-    // Normalize direction
-    final dirX = dx / distance;
-    final dirY = dy / distance;
-
-    // Calculate affected region bounds for optimization
-    final brushRadius = brushSize / 2;
-    final minX = (math.min(start.dx, end.dx) - brushRadius).floor().clamp(0, width - 1);
-    final maxX = (math.max(start.dx, end.dx) + brushRadius).ceil().clamp(0, width - 1);
-    final minY = (math.min(start.dy, end.dy) - brushRadius).floor().clamp(0, height - 1);
-    final maxY = (math.max(start.dy, end.dy) + brushRadius).ceil().clamp(0, height - 1);
-
-    // Apply warp only to affected region
-    for (int y = minY; y <= maxY; y++) {
-      for (int x = minX; x <= maxX; x++) {
-        final pixelX = x.toDouble();
-        final pixelY = y.toDouble();
-
-        // Calculate distance from stroke line (perpendicular distance)
-        final toStartX = pixelX - start.dx;
-        final toStartY = pixelY - start.dy;
-        final strokeLength = distance;
-
-        // Project point onto stroke line
-        final t = math.max(0.0, math.min(1.0, (toStartX * dirX + toStartY * dirY) / strokeLength));
-        final projX = start.dx + t * dx;
-        final projY = start.dy + t * dy;
-
-        // Distance from point to stroke line
-        final distToLine = math.sqrt(
-          math.pow(pixelX - projX, 2) + math.pow(pixelY - projY, 2),
-        );
-
-        if (distToLine < brushRadius) {
-          // Calculate falloff (stronger at center, weaker at edges)
-          final falloff = 1.0 - (distToLine / brushRadius);
-          final strength = falloff * falloff * intensity; // Quadratic falloff
-
-          // Calculate displacement (push pixels along stroke direction)
-          final displacementX = dirX * strength * brushRadius * 0.8;
-          final displacementY = dirY * strength * brushRadius * 0.8;
-
-          // Source coordinates (backward mapping - where to sample from)
-          final srcX = (pixelX - displacementX).round();
-          final srcY = (pixelY - displacementY).round();
-
-          // Clamp to image bounds
-          final clampedX = srcX.clamp(0, width - 1);
-          final clampedY = srcY.clamp(0, height - 1);
-
-          // Sample from source and write to output
-          final pixel = image.getPixel(clampedX, clampedY);
-          output.setPixel(x, y, pixel);
-        }
-      }
-    }
-
-    return output;
+  void _resetImage() {
+    if (_originalImage == null) return;
+    
+    _uiImageToImage(_originalImage!).then((imgData) {
+      setState(() {
+        _currentImage = _originalImage;
+        _workingImage = imgData;
+        _strokes.clear();
+        _currentPosition = null;
+        _zoomScale = 1.0;
+        _panOffset = Offset.zero;
+      });
+    });
   }
 
-  void _resetImage() {
+  void _handleScaleStart(ScaleStartDetails details) {
+    if (_currentMode == 'frame') {
+      // Frame mode: handle zoom/pan
+      if (details.pointerCount == 2) {
+        _lastFocalPoint = details.localFocalPoint;
+      }
+    } else {
+      // Liquify mode: handle liquify
+      if (details.pointerCount == 1) {
+        final imagePos = _displayToImageCoordinates(details.localFocalPoint);
+        setState(() {
+          _currentPosition = imagePos;
+        });
+      }
+    }
+  }
+
+  void _handleScaleUpdate(ScaleUpdateDetails details) {
+    if (_currentImage == null) return;
+
+    if (_currentMode == 'frame') {
+      // FRAME MODE: Zoom and Pan only
+      if (details.pointerCount == 2) {
+        // Handle zoom (pinch)
+        if (details.scale != 1.0) {
+          // Reduce zoom sensitivity by using a damped scale factor
+          final scaleDelta = details.scale - 1.0;
+          final dampedScale = 1.0 + (scaleDelta * 0.08); // Reduce sensitivity to 8% for much smoother control
+          final newZoom = (_zoomScale * dampedScale).clamp(0.5, 5.0);
+          
+          // Zoom around focal point
+          if (_lastFocalPoint != null) {
+            final zoomDelta = newZoom - _zoomScale;
+            
+            // Adjust pan offset to zoom around focal point
+            final screenSize = MediaQuery.of(context).size;
+            final gestureAreaHeight = screenSize.height - 200;
+            final centerX = screenSize.width / 2;
+            final centerY = gestureAreaHeight / 2;
+            
+            // Calculate focal point relative to image center
+            final focalRelativeToCenter = details.focalPoint - Offset(centerX, centerY);
+            
+            // Adjust pan offset based on zoom
+            _panOffset = Offset(
+              _panOffset.dx - focalRelativeToCenter.dx * (zoomDelta / _zoomScale),
+              _panOffset.dy - focalRelativeToCenter.dy * (zoomDelta / _zoomScale),
+            );
+          }
+          
+          setState(() {
+            _zoomScale = newZoom;
+            _lastFocalPoint = details.focalPoint;
+          });
+        }
+        // Handle pan (two fingers moving without scaling)
+        else if (details.scale == 1.0) {
+          final delta = details.focalPointDelta;
+          setState(() {
+            _panOffset = Offset(
+              _panOffset.dx + delta.dx,
+              _panOffset.dy + delta.dy,
+            );
+          });
+        }
+      }
+      // Single finger drag in frame mode = pan
+      else if (details.pointerCount == 1) {
+        final delta = details.focalPointDelta;
+        setState(() {
+          _panOffset = Offset(
+            _panOffset.dx + delta.dx,
+            _panOffset.dy + delta.dy,
+          );
+        });
+      }
+    } else {
+      // LIQUIFY MODE: Apply liquify effect only
+      if (details.pointerCount == 1) {
+        final newImagePosition = _displayToImageCoordinates(details.localFocalPoint);
+
+        if (_currentPosition != null) {
+          // Step 3 & 4: Calculate deformation and update canvas
+          _applyDeformation(_currentPosition!, newImagePosition);
+          
+          // Add stroke to history
+          _strokes.add(LiquifyStroke(
+            start: _currentPosition!,
+            end: newImagePosition,
+            brushSize: _brushSize,
+            intensity: _brushIntensity,
+          ));
+        }
+
+        setState(() {
+          _currentPosition = newImagePosition;
+        });
+      }
+    }
+  }
+
+  void _handleScaleEnd(ScaleEndDetails details) {
+    _lastFocalPoint = null;
     setState(() {
-      _currentImage = _originalImage;
-      _strokes.clear();
       _currentPosition = null;
     });
   }
 
   Future<Uint8List?> _saveImage() async {
     if (_currentImage == null) return null;
-
     final byteData = await _currentImage!.toByteData(format: ui.ImageByteFormat.png);
     return byteData?.buffer.asUint8List();
   }
@@ -224,16 +345,9 @@ class _LiquifyEditorState extends State<LiquifyEditor> {
 
     final imageSize = Size(_currentImage!.width.toDouble(), _currentImage!.height.toDouble());
     final screenSize = MediaQuery.of(context).size;
-    _scale = math.min(
+    _baseScale = math.min(
       screenSize.width / imageSize.width,
       (screenSize.height - 200) / imageSize.height,
-    );
-    final displaySize = Size(imageSize.width * _scale, imageSize.height * _scale);
-
-    // Calculate offset to center the image
-    _imageOffset = Offset(
-      (screenSize.width - displaySize.width) / 2,
-      ((screenSize.height - 200) - displaySize.height) / 2,
     );
 
     return Scaffold(
@@ -260,70 +374,57 @@ class _LiquifyEditorState extends State<LiquifyEditor> {
       ),
       body: Column(
         children: [
-          // Image display area
           Expanded(
-            child: Stack(
-              children: [
-
-                Center(
-                  child: CustomPaint(
-                    size: displaySize,
-                    painter: LiquifyPainter(
-                      image: _currentImage!,
-                      strokes: _strokes,
-                      brushSize: _brushSize * _scale,
-                      brushIntensity: _brushIntensity,
-                      currentPosition: _currentPosition != null
-                          ? Offset(
-                        _currentPosition!.dx * _scale + _imageOffset.dx,
-                        _currentPosition!.dy * _scale + _imageOffset.dy,
-                      )
-                          : null,
+            child: LayoutBuilder(
+              builder: (context, constraints) {
+                // Store the gesture area size for coordinate conversion
+                WidgetsBinding.instance.addPostFrameCallback((_) {
+                  if (_gestureAreaSize != constraints.biggest) {
+                    setState(() {
+                      _gestureAreaSize = constraints.biggest;
+                    });
+                  }
+                });
+                
+                return GestureDetector(
+                  // Combined gesture handler: handles both zoom (pinch) and liquify (drag)
+                  onScaleStart: _handleScaleStart,
+                  onScaleUpdate: _handleScaleUpdate,
+                  onScaleEnd: _handleScaleEnd,
+                  child: Transform.translate(
+                offset: _panOffset,
+                child: Center(
+                  // Step 4: CustomPainter redraws canvas with updated image
+                  child: Transform.scale(
+                    scale: _zoomScale,
+                    child: CustomPaint(
+                      size: Size(
+                        imageSize.width * _baseScale,
+                        imageSize.height * _baseScale,
+                      ),
+                      painter: LiquifyPainter(
+                        image: _currentImage!,
+                        strokes: _strokes,
+                        brushSize: _brushSize * _baseScale,
+                        brushIntensity: _brushIntensity,
+                        currentPosition: _currentPosition != null
+                            ? Offset(
+                                _currentPosition!.dx * _baseScale,
+                                _currentPosition!.dy * _baseScale,
+                              )
+                            : null,
+                      ),
                     ),
                   ),
                 ),
-                Positioned.fill(
-                  child: GestureDetector(
-                    onPanStart: (details) {
-                      final imagePos = _displayToImageCoordinates(details.localPosition);
-                      setState(() {
-                        _currentPosition = imagePos;
-                      });
-                    },
-                    onPanUpdate: (details) async {
-                      if (_currentImage == null || _isProcessing) return;
-
-                      final newImagePosition = _displayToImageCoordinates(details.localPosition);
-
-                      if (_currentPosition != null) {
-                        final stroke = LiquifyStroke(
-                          start: _currentPosition!,
-                          end: newImagePosition,
-                          brushSize: _brushSize,
-                          intensity: _brushIntensity,
-                        );
-
-                        setState(() {
-                          _currentPosition = newImagePosition;
-                        });
-
-                        await _applyLiquifyEffect(stroke);
-                      } else {
-                        setState(() {
-                          _currentPosition = newImagePosition;
-                        });
-                      }
-                    },
-                    onPanEnd: _onPanEnd,
-                    child: Container(color: Colors.transparent),
-                  ),
-                ),
-              ],
+              ),
+                );
+              },
             ),
           ),
-          // Controls
+          // Mode selection buttons
           Container(
-            padding: const EdgeInsets.all(16),
+            padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
             decoration: BoxDecoration(
               color: Theme.of(context).colorScheme.surface,
               boxShadow: [
@@ -337,52 +438,108 @@ class _LiquifyEditorState extends State<LiquifyEditor> {
             child: Column(
               mainAxisSize: MainAxisSize.min,
               children: [
-                // Brush Size
+                // Mode toggle buttons
                 Row(
+                  mainAxisAlignment: MainAxisAlignment.spaceEvenly,
                   children: [
-                    const Icon(Icons.brush, size: 20),
-                    const SizedBox(width: 8),
-                    const Text('Brush Size:'),
+                    // Frame/Adjust Mode Button
                     Expanded(
-                      child: Slider(
-                        value: _brushSize,
-                        min: 10,
-                        max: 200,
-                        divisions: 19,
-                        label: _brushSize.round().toString(),
-                        onChanged: (value) {
+                      child: ElevatedButton.icon(
+                        onPressed: () {
                           setState(() {
-                            _brushSize = value;
+                            _currentMode = 'frame';
+                            _currentPosition = null;
                           });
                         },
+                        icon: Icon(
+                          _currentMode == 'frame' ? Icons.crop_free : Icons.crop_free_outlined,
+                        ),
+                        label: const Text('Frame'),
+                        style: ElevatedButton.styleFrom(
+                          backgroundColor: _currentMode == 'frame'
+                              ? Theme.of(context).colorScheme.primary
+                              : Theme.of(context).colorScheme.surface,
+                          foregroundColor: _currentMode == 'frame'
+                              ? Colors.white
+                              : Theme.of(context).colorScheme.onSurface,
+                          padding: const EdgeInsets.symmetric(vertical: 12),
+                        ),
                       ),
                     ),
-                    Text('${_brushSize.round()}'),
-                  ],
-                ),
-                // Brush Intensity
-                Row(
-                  children: [
-                    const Icon(Icons.tune, size: 20),
-                    const SizedBox(width: 8),
-                    const Text('Intensity:'),
+                    const SizedBox(width: 12),
+                    // Liquify Mode Button
                     Expanded(
-                      child: Slider(
-                        value: _brushIntensity,
-                        min: 0.1,
-                        max: 1.0,
-                        divisions: 9,
-                        label: _brushIntensity.toStringAsFixed(1),
-                        onChanged: (value) {
+                      child: ElevatedButton.icon(
+                        onPressed: () {
                           setState(() {
-                            _brushIntensity = value;
+                            _currentMode = 'liquify';
                           });
                         },
+                        icon: Icon(
+                          _currentMode == 'liquify' ? Icons.brush : Icons.brush_outlined,
+                        ),
+                        label: const Text('Liquify'),
+                        style: ElevatedButton.styleFrom(
+                          backgroundColor: _currentMode == 'liquify'
+                              ? Theme.of(context).colorScheme.primary
+                              : Theme.of(context).colorScheme.surface,
+                          foregroundColor: _currentMode == 'liquify'
+                              ? Colors.white
+                              : Theme.of(context).colorScheme.onSurface,
+                          padding: const EdgeInsets.symmetric(vertical: 12),
+                        ),
                       ),
                     ),
-                    Text(_brushIntensity.toStringAsFixed(1)),
                   ],
                 ),
+                // Liquify controls (only show in liquify mode)
+                if (_currentMode == 'liquify') ...[
+                  const SizedBox(height: 16),
+                  Row(
+                    children: [
+                      const Icon(Icons.brush, size: 20),
+                      const SizedBox(width: 8),
+                      const Text('Brush Size:'),
+                      Expanded(
+                        child: Slider(
+                          value: _brushSize,
+                          min: 10,
+                          max: 200,
+                          divisions: 19,
+                          label: _brushSize.round().toString(),
+                          onChanged: (value) {
+                            setState(() {
+                              _brushSize = value;
+                            });
+                          },
+                        ),
+                      ),
+                      Text('${_brushSize.round()}'),
+                    ],
+                  ),
+                  Row(
+                    children: [
+                      const Icon(Icons.tune, size: 20),
+                      const SizedBox(width: 8),
+                      const Text('Intensity:'),
+                      Expanded(
+                        child: Slider(
+                          value: _brushIntensity,
+                          min: 0.1,
+                          max: 1.0,
+                          divisions: 9,
+                          label: _brushIntensity.toStringAsFixed(1),
+                          onChanged: (value) {
+                            setState(() {
+                              _brushIntensity = value;
+                            });
+                          },
+                        ),
+                      ),
+                      Text(_brushIntensity.toStringAsFixed(1)),
+                    ],
+                  ),
+                ],
               ],
             ),
           ),
