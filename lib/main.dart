@@ -61,10 +61,12 @@ class _HomeScreenState extends State<HomeScreen> {
   Future<void> _openImageEditor() async {
     if (_selectedImage == null) return;
 
-    final Uint8List imageBytes = await _selectedImage!.readAsBytes();
+    // Read image bytes and navigate immediately
+    Uint8List imageBytes = await _selectedImage!.readAsBytes();
     
     if (!mounted) return;
     
+    // Navigate immediately - editor will handle compression and show loader
     final editedImageBytes = await Navigator.push<Uint8List>(
       context,
       MaterialPageRoute(

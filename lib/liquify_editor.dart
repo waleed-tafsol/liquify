@@ -1,10 +1,12 @@
 import 'dart:ui' as ui;
 import 'dart:typed_data';
 import 'dart:math' as math;
+import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:image/image.dart' as img;
 import 'liquify_painter.dart';
+import 'pan_zoom_controller.dart';
 
 class LiquifyEditor extends StatefulWidget {
   final Uint8List imageBytes;
@@ -15,42 +17,135 @@ class LiquifyEditor extends StatefulWidget {
   State<LiquifyEditor> createState() => _LiquifyEditorState();
 }
 
+/// Editing modes for the liquify editor.
+enum EditingMode {
+  frame,   // Pan & zoom
+  liquify, // Apply liquify brush
+}
+
 class _LiquifyEditorState extends State<LiquifyEditor> {
   ui.Image? _originalImage;
   ui.Image? _currentImage;
   img.Image? _workingImage; // Keep in img.Image format for faster warping
   final List<LiquifyStroke> _strokes = [];
   Offset? _currentPosition;
+  Offset? _previousPosition; // For calculating displacement vector
+  Offset? _currentDisplacement; // Current displacement vector for shader
   double _brushSize = 50.0;
   double _brushIntensity = 0.5;
   double _baseScale = 1.0; // Base scale to fit image to screen
-  double _zoomScale = 1.0; // User zoom level (pinch)
-  Offset _panOffset = Offset.zero; // Pan offset for zoomed image
-  Offset? _lastFocalPoint; // Last focal point for pinch gesture
+  final PanZoomController _panZoomController = PanZoomController();
   Size? _gestureAreaSize; // Size of the gesture detector area
+  bool _isLoadingImage = false; // Loading state for image processing
+  bool _isSaving = false; // Loading state for saving image
   
-  // Mode selection: 'frame' for zoom/pan, 'liquify' for editing
-  String _currentMode = 'liquify'; // 'frame' or 'liquify'
+  // Throttling for liquify updates
+  Timer? _updateTimer;
+  Offset? _pendingStart;
+  Offset? _pendingEnd;
+  DateTime _lastUpdateTime = DateTime.now();
+  static const Duration _updateThrottle = Duration(milliseconds: 16); // Update max every 16ms (~60fps)
+  static const int _maxImageDimension = 800; // Max size of the working image (longest side)
+  
+  // Mode selection
+  EditingMode _currentMode = EditingMode.liquify;
 
   @override
   void initState() {
     super.initState();
+    // Initialize shader asynchronously
+    LiquifyPainter.initializeShader();
     _loadImage();
+  }
+
+  @override
+  void dispose() {
+    _updateTimer?.cancel();
+    super.dispose();
   }
 
   // Step 1: Load Image into Image object
   Future<void> _loadImage() async {
-    final codec = await ui.instantiateImageCodec(widget.imageBytes);
-    final frame = await codec.getNextFrame();
-    
-    // Convert to img.Image format for warping operations
-    final imgData = await _uiImageToImage(frame.image);
-    
-    setState(() {
-      _originalImage = frame.image;
-      _currentImage = frame.image;
-      _workingImage = imgData;
-    });
+    try {
+      if (mounted) {
+        setState(() {
+          _isLoadingImage = true;
+        });
+      }
+
+      // Yield to UI thread to show loading indicator immediately
+      await Future.delayed(const Duration(milliseconds: 50));
+
+      // Decode image to check dimensions
+      final decodedImage = img.decodeImage(widget.imageBytes);
+      if (decodedImage == null) {
+        if (mounted) {
+          setState(() {
+            _isLoadingImage = false;
+          });
+        }
+        return;
+      }
+
+      // Check if image is too large for smooth editing
+      const maxDimension = _maxImageDimension;
+      final width = decodedImage.width;
+      final height = decodedImage.height;
+      
+      img.Image imageToProcess = decodedImage;
+      bool needsResizing = width > maxDimension || height > maxDimension;
+      
+      if (needsResizing) {
+        // Yield to UI thread during heavy processing
+        await Future.delayed(const Duration(milliseconds: 10));
+        
+        // Calculate new dimensions maintaining aspect ratio
+        double scale;
+        if (width > height) {
+          scale = maxDimension / width;
+        } else {
+          scale = maxDimension / height;
+        }
+        
+        final newWidth = (width * scale).round();
+        final newHeight = (height * scale).round();
+        
+        // Resize image for smooth editing
+        imageToProcess = img.copyResize(
+          decodedImage,
+          width: newWidth,
+          height: newHeight,
+          interpolation: img.Interpolation.linear,
+        );
+        
+        // Yield to UI thread
+        await Future.delayed(const Duration(milliseconds: 10));
+      }
+
+      // Convert resized image to UI Image
+      final pngBytes = Uint8List.fromList(img.encodePng(imageToProcess));
+      final codec = await ui.instantiateImageCodec(pngBytes);
+      final frame = await codec.getNextFrame();
+      final imageToUse = frame.image;
+
+      // Use the processed image for warping operations
+      final imgData = imageToProcess;
+
+      if (mounted) {
+        setState(() {
+          _originalImage = imageToUse;
+          _currentImage = imageToUse;
+          _workingImage = imgData;
+          _isLoadingImage = false;
+        });
+      }
+    } catch (e) {
+      if (mounted) {
+        setState(() {
+          _isLoadingImage = false;
+        });
+      }
+    }
   }
 
   Offset _displayToImageCoordinates(Offset localPos) {
@@ -67,13 +162,13 @@ class _LiquifyEditorState extends State<LiquifyEditor> {
     final centerY = _gestureAreaSize!.height / 2;
     
     // Account for pan offset and find where CustomPaint center is in GestureDetector coordinates
-    final paintCenterX = centerX + _panOffset.dx;
-    final paintCenterY = centerY + _panOffset.dy;
+    final paintCenterX = centerX + _panZoomController.panOffset.dx;
+    final paintCenterY = centerY + _panZoomController.panOffset.dy;
     
     // Convert GestureDetector local position to CustomPaint local coordinates
-    // The CustomPaint is scaled by _zoomScale, so we need to undo that
-    final localX = (localPos.dx - paintCenterX) / _zoomScale;
-    final localY = (localPos.dy - paintCenterY) / _zoomScale;
+    // The CustomPaint is scaled by zoomScale, so we need to undo that
+    final localX = (localPos.dx - paintCenterX) / _panZoomController.zoomScale;
+    final localY = (localPos.dy - paintCenterY) / _panZoomController.zoomScale;
     
     // Convert from center-relative to top-left-relative coordinates
     final paintX = localX + baseDisplaySize.width / 2;
@@ -87,9 +182,16 @@ class _LiquifyEditorState extends State<LiquifyEditor> {
   }
 
 
-  // Step 3: Calculate Deformation based on brush size and distance from touch point
-  void _applyDeformation(Offset start, Offset end) {
+  // Process pending deformation with throttling
+  void _processPendingDeformation() {
+    if (_pendingStart == null || _pendingEnd == null) return;
     if (_currentImage == null || _workingImage == null) return;
+
+    final start = _pendingStart!;
+    final end = _pendingEnd!;
+    _pendingStart = null;
+    _pendingEnd = null;
+    _lastUpdateTime = DateTime.now();
 
     // Calculate warp factor based on brush size and distance
     final strokeDistance = (end - start).distance;
@@ -107,9 +209,18 @@ class _LiquifyEditorState extends State<LiquifyEditor> {
     // Update working image
     _workingImage = warpedImage;
 
+    // Add stroke to history
+    _strokes.add(LiquifyStroke(
+      start: start,
+      end: end,
+      brushSize: _brushSize,
+      intensity: _brushIntensity,
+    ));
+
     // Step 4: Redraw Canvas - Convert back to UI Image and trigger repaint
     _updateCanvasImage(warpedImage);
   }
+
 
   // Calculate warp deformation
   img.Image _calculateWarp(
@@ -213,24 +324,23 @@ class _LiquifyEditorState extends State<LiquifyEditor> {
         _workingImage = imgData;
         _strokes.clear();
         _currentPosition = null;
-        _zoomScale = 1.0;
-        _panOffset = Offset.zero;
+        _panZoomController.reset();
       });
     });
   }
 
   void _handleScaleStart(ScaleStartDetails details) {
-    if (_currentMode == 'frame') {
+    if (_currentMode == EditingMode.frame) {
       // Frame mode: handle zoom/pan
-      if (details.pointerCount == 2) {
-        _lastFocalPoint = details.localFocalPoint;
-      }
+      _panZoomController.handleScaleStart(details, pointerCount: details.pointerCount);
     } else {
       // Liquify mode: handle liquify
       if (details.pointerCount == 1) {
         final imagePos = _displayToImageCoordinates(details.localFocalPoint);
         setState(() {
           _currentPosition = imagePos;
+          _previousPosition = null;
+          _currentDisplacement = null;
         });
       }
     }
@@ -239,106 +349,141 @@ class _LiquifyEditorState extends State<LiquifyEditor> {
   void _handleScaleUpdate(ScaleUpdateDetails details) {
     if (_currentImage == null) return;
 
-    if (_currentMode == 'frame') {
+    if (_currentMode == EditingMode.frame) {
       // FRAME MODE: Zoom and Pan only
-      if (details.pointerCount == 2) {
-        // Handle zoom (pinch)
-        if (details.scale != 1.0) {
-          // Reduce zoom sensitivity by using a damped scale factor
-          final scaleDelta = details.scale - 1.0;
-          final dampedScale = 1.0 + (scaleDelta * 0.08); // Reduce sensitivity to 8% for much smoother control
-          final newZoom = (_zoomScale * dampedScale).clamp(0.5, 5.0);
-          
-          // Zoom around focal point
-          if (_lastFocalPoint != null) {
-            final zoomDelta = newZoom - _zoomScale;
-            
-            // Adjust pan offset to zoom around focal point
-            final screenSize = MediaQuery.of(context).size;
-            final gestureAreaHeight = screenSize.height - 200;
-            final centerX = screenSize.width / 2;
-            final centerY = gestureAreaHeight / 2;
-            
-            // Calculate focal point relative to image center
-            final focalRelativeToCenter = details.focalPoint - Offset(centerX, centerY);
-            
-            // Adjust pan offset based on zoom
-            _panOffset = Offset(
-              _panOffset.dx - focalRelativeToCenter.dx * (zoomDelta / _zoomScale),
-              _panOffset.dy - focalRelativeToCenter.dy * (zoomDelta / _zoomScale),
-            );
-          }
-          
-          setState(() {
-            _zoomScale = newZoom;
-            _lastFocalPoint = details.focalPoint;
-          });
-        }
-        // Handle pan (two fingers moving without scaling)
-        else if (details.scale == 1.0) {
-          final delta = details.focalPointDelta;
-          setState(() {
-            _panOffset = Offset(
-              _panOffset.dx + delta.dx,
-              _panOffset.dy + delta.dy,
-            );
-          });
-        }
-      }
-      // Single finger drag in frame mode = pan
-      else if (details.pointerCount == 1) {
-        final delta = details.focalPointDelta;
-        setState(() {
-          _panOffset = Offset(
-            _panOffset.dx + delta.dx,
-            _panOffset.dy + delta.dy,
-          );
-        });
-      }
+      final screenSize = MediaQuery.of(context).size;
+      final gestureAreaHeight = screenSize.height - 200;
+      
+      _panZoomController.handleScaleUpdate(
+        details,
+        pointerCount: details.pointerCount,
+        screenSize: screenSize,
+        gestureAreaHeight: gestureAreaHeight,
+      );
+      
+      setState(() {
+        // Trigger rebuild to update pan/zoom
+      });
     } else {
       // LIQUIFY MODE: Apply liquify effect only
       if (details.pointerCount == 1) {
         final newImagePosition = _displayToImageCoordinates(details.localFocalPoint);
+        
+        // Calculate displacement in screen coordinates for shader
+        // The shader works in screen/pixel space
+        final screenDisplacement = details.focalPointDelta * _brushIntensity;
 
-        if (_currentPosition != null) {
-          // Step 3 & 4: Calculate deformation and update canvas
-          _applyDeformation(_currentPosition!, newImagePosition);
-          
-          // Add stroke to history
-          _strokes.add(LiquifyStroke(
-            start: _currentPosition!,
-            end: newImagePosition,
-            brushSize: _brushSize,
-            intensity: _brushIntensity,
-          ));
-        }
+        // Store previous position before updating
+        final previousPosition = _currentPosition;
 
+        // Update brush position and displacement immediately for visual feedback
         setState(() {
+          _previousPosition = previousPosition;
           _currentPosition = newImagePosition;
+          _currentDisplacement = screenDisplacement;
         });
+
+        if (previousPosition != null) {
+          // Always update pending deformation (accumulate strokes)
+          _pendingStart = previousPosition;
+          _pendingEnd = newImagePosition;
+          
+          final now = DateTime.now();
+          final timeSinceLastUpdate = now.difference(_lastUpdateTime);
+          
+          // If enough time has passed, process immediately
+          if (timeSinceLastUpdate >= _updateThrottle) {
+            // Cancel any pending timer
+            _updateTimer?.cancel();
+            _updateTimer = null;
+            // Process immediately
+            _processPendingDeformation();
+          } else {
+            // Schedule update after throttle period (only if timer not already running)
+            _updateTimer?.cancel();
+            _updateTimer = Timer(_updateThrottle - timeSinceLastUpdate, () {
+              _processPendingDeformation();
+              _updateTimer = null;
+            });
+          }
+        }
       }
     }
   }
 
   void _handleScaleEnd(ScaleEndDetails details) {
-    _lastFocalPoint = null;
-    setState(() {
-      _currentPosition = null;
-    });
+    if (_currentMode == EditingMode.frame) {
+      _panZoomController.handleScaleEnd();
+    } else {
+      // Process any pending deformation before ending
+      _updateTimer?.cancel();
+      if (_pendingStart != null && _pendingEnd != null) {
+        _processPendingDeformation();
+      }
+      // Clear displacement and position for shader
+      setState(() {
+        _currentDisplacement = null;
+        _previousPosition = null;
+        _currentPosition = null;
+      });
+    }
   }
 
   Future<Uint8List?> _saveImage() async {
     if (_currentImage == null) return null;
-    final byteData = await _currentImage!.toByteData(format: ui.ImageByteFormat.png);
-    return byteData?.buffer.asUint8List();
+
+    if (mounted) {
+      setState(() {
+        _isSaving = true;
+      });
+    }
+
+    // Yield to UI thread to show loading indicator
+    await Future.delayed(const Duration(milliseconds: 50));
+
+    try {
+      final byteData = await _currentImage!.toByteData(format: ui.ImageByteFormat.png);
+      final bytes = byteData?.buffer.asUint8List();
+
+      if (mounted) {
+        setState(() {
+          _isSaving = false;
+        });
+      }
+
+      return bytes;
+    } catch (e) {
+      if (mounted) {
+        setState(() {
+          _isSaving = false;
+        });
+      }
+      return null;
+    }
   }
 
   @override
   Widget build(BuildContext context) {
-    if (_currentImage == null) {
-      return const Scaffold(
+    if (_currentImage == null || _isLoadingImage) {
+      return Scaffold(
+        appBar: AppBar(
+          title: const Text('Liquify Editor'),
+          backgroundColor: Theme.of(context).colorScheme.inversePrimary,
+        ),
         body: Center(
-          child: CircularProgressIndicator(),
+          child: Column(
+            mainAxisAlignment: MainAxisAlignment.center,
+            children: [
+              const CircularProgressIndicator(),
+              const SizedBox(height: 16),
+              Text(
+                _isLoadingImage 
+                    ? 'Compressing image for smooth editing...' 
+                    : 'Loading image...',
+                style: Theme.of(context).textTheme.bodyLarge,
+              ),
+            ],
+          ),
         ),
       );
     }
@@ -362,7 +507,7 @@ class _LiquifyEditorState extends State<LiquifyEditor> {
           ),
           IconButton(
             icon: const Icon(Icons.save),
-            onPressed: () async {
+            onPressed: _isSaving ? null : () async {
               final savedBytes = await _saveImage();
               if (savedBytes != null && mounted) {
                 Navigator.of(context).pop(savedBytes);
@@ -372,8 +517,10 @@ class _LiquifyEditorState extends State<LiquifyEditor> {
           ),
         ],
       ),
-      body: Column(
+      body: Stack(
         children: [
+          Column(
+            children: [
           Expanded(
             child: LayoutBuilder(
               builder: (context, constraints) {
@@ -392,11 +539,11 @@ class _LiquifyEditorState extends State<LiquifyEditor> {
                   onScaleUpdate: _handleScaleUpdate,
                   onScaleEnd: _handleScaleEnd,
                   child: Transform.translate(
-                offset: _panOffset,
+                offset: _panZoomController.panOffset,
                 child: Center(
                   // Step 4: CustomPainter redraws canvas with updated image
                   child: Transform.scale(
-                    scale: _zoomScale,
+                    scale: _panZoomController.zoomScale,
                     child: CustomPaint(
                       size: Size(
                         imageSize.width * _baseScale,
@@ -407,10 +554,19 @@ class _LiquifyEditorState extends State<LiquifyEditor> {
                         strokes: _strokes,
                         brushSize: _brushSize * _baseScale,
                         brushIntensity: _brushIntensity,
-                        currentPosition: _currentPosition != null
+                        currentPosition: _currentPosition != null && _currentMode == EditingMode.liquify
                             ? Offset(
                                 _currentPosition!.dx * _baseScale,
                                 _currentPosition!.dy * _baseScale,
+                              )
+                            : null,
+                        currentDisplacement: _currentDisplacement != null && _currentMode == EditingMode.liquify
+                            ? _currentDisplacement! * _baseScale
+                            : null,
+                        previousPosition: _previousPosition != null && _currentMode == EditingMode.liquify
+                            ? Offset(
+                                _previousPosition!.dx * _baseScale,
+                                _previousPosition!.dy * _baseScale,
                               )
                             : null,
                       ),
@@ -422,129 +578,323 @@ class _LiquifyEditorState extends State<LiquifyEditor> {
               },
             ),
           ),
-          // Mode selection buttons
+          // Mode selection buttons with professional styling
           Container(
-            padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+            padding: const EdgeInsets.fromLTRB(20, 20, 20, 16),
             decoration: BoxDecoration(
               color: Theme.of(context).colorScheme.surface,
+              borderRadius: const BorderRadius.only(
+                topLeft: Radius.circular(24),
+                topRight: Radius.circular(24),
+              ),
               boxShadow: [
                 BoxShadow(
-                  color: Colors.black.withOpacity(0.1),
-                  blurRadius: 10,
-                  offset: const Offset(0, -2),
+                  color: Colors.black.withOpacity(0.15),
+                  blurRadius: 20,
+                  offset: const Offset(0, -4),
                 ),
               ],
             ),
             child: Column(
               mainAxisSize: MainAxisSize.min,
               children: [
-                // Mode toggle buttons
+                // Mode toggle buttons with improved styling
                 Row(
                   mainAxisAlignment: MainAxisAlignment.spaceEvenly,
                   children: [
                     // Frame/Adjust Mode Button
                     Expanded(
-                      child: ElevatedButton.icon(
+                      child: _buildModeButton(
+                        context,
+                        icon: _currentMode == EditingMode.frame 
+                            ? Icons.crop_free 
+                            : Icons.crop_free_outlined,
+                        label: 'Frame',
+                        isActive: _currentMode == EditingMode.frame,
                         onPressed: () {
                           setState(() {
-                            _currentMode = 'frame';
+                            _currentMode = EditingMode.frame;
                             _currentPosition = null;
                           });
                         },
-                        icon: Icon(
-                          _currentMode == 'frame' ? Icons.crop_free : Icons.crop_free_outlined,
-                        ),
-                        label: const Text('Frame'),
-                        style: ElevatedButton.styleFrom(
-                          backgroundColor: _currentMode == 'frame'
-                              ? Theme.of(context).colorScheme.primary
-                              : Theme.of(context).colorScheme.surface,
-                          foregroundColor: _currentMode == 'frame'
-                              ? Colors.white
-                              : Theme.of(context).colorScheme.onSurface,
-                          padding: const EdgeInsets.symmetric(vertical: 12),
-                        ),
                       ),
                     ),
-                    const SizedBox(width: 12),
+                    const SizedBox(width: 16),
                     // Liquify Mode Button
                     Expanded(
-                      child: ElevatedButton.icon(
+                      child: _buildModeButton(
+                        context,
+                        icon: _currentMode == EditingMode.liquify 
+                            ? Icons.brush 
+                            : Icons.brush_outlined,
+                        label: 'Liquify',
+                        isActive: _currentMode == EditingMode.liquify,
                         onPressed: () {
                           setState(() {
-                            _currentMode = 'liquify';
+                            _currentMode = EditingMode.liquify;
                           });
                         },
-                        icon: Icon(
-                          _currentMode == 'liquify' ? Icons.brush : Icons.brush_outlined,
-                        ),
-                        label: const Text('Liquify'),
-                        style: ElevatedButton.styleFrom(
-                          backgroundColor: _currentMode == 'liquify'
-                              ? Theme.of(context).colorScheme.primary
-                              : Theme.of(context).colorScheme.surface,
-                          foregroundColor: _currentMode == 'liquify'
-                              ? Colors.white
-                              : Theme.of(context).colorScheme.onSurface,
-                          padding: const EdgeInsets.symmetric(vertical: 12),
-                        ),
                       ),
                     ),
                   ],
                 ),
                 // Liquify controls (only show in liquify mode)
-                if (_currentMode == 'liquify') ...[
-                  const SizedBox(height: 16),
-                  Row(
-                    children: [
-                      const Icon(Icons.brush, size: 20),
-                      const SizedBox(width: 8),
-                      const Text('Brush Size:'),
-                      Expanded(
-                        child: Slider(
-                          value: _brushSize,
-                          min: 10,
-                          max: 200,
-                          divisions: 19,
-                          label: _brushSize.round().toString(),
-                          onChanged: (value) {
-                            setState(() {
-                              _brushSize = value;
-                            });
-                          },
-                        ),
-                      ),
-                      Text('${_brushSize.round()}'),
-                    ],
+                if (_currentMode == EditingMode.liquify) ...[
+                  const SizedBox(height: 20),
+                  _buildControlRow(
+                    context,
+                    icon: Icons.brush,
+                    label: 'Brush Size',
+                    value: _brushSize,
+                    min: 10,
+                    max: 200,
+                    divisions: 19,
+                    onChanged: (value) {
+                      setState(() {
+                        _brushSize = value;
+                      });
+                    },
                   ),
-                  Row(
-                    children: [
-                      const Icon(Icons.tune, size: 20),
-                      const SizedBox(width: 8),
-                      const Text('Intensity:'),
-                      Expanded(
-                        child: Slider(
-                          value: _brushIntensity,
-                          min: 0.1,
-                          max: 1.0,
-                          divisions: 9,
-                          label: _brushIntensity.toStringAsFixed(1),
-                          onChanged: (value) {
-                            setState(() {
-                              _brushIntensity = value;
-                            });
-                          },
-                        ),
-                      ),
-                      Text(_brushIntensity.toStringAsFixed(1)),
-                    ],
+                  const SizedBox(height: 12),
+                  _buildControlRow(
+                    context,
+                    icon: Icons.tune,
+                    label: 'Intensity',
+                    value: _brushIntensity,
+                    min: 0.1,
+                    max: 1.0,
+                    divisions: 9,
+                    formatValue: (val) => val.toStringAsFixed(1),
+                    onChanged: (value) {
+                      setState(() {
+                        _brushIntensity = value;
+                      });
+                    },
                   ),
                 ],
               ],
             ),
           ),
         ],
+          ),
+          // Info overlay showing zoom and brush size
+          Positioned(
+            top: 16,
+            right: 16,
+            child: Container(
+              padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+              decoration: BoxDecoration(
+                color: Colors.black.withOpacity(0.7),
+                borderRadius: BorderRadius.circular(12),
+                border: Border.all(
+                  color: Colors.white.withOpacity(0.2),
+                  width: 1,
+                ),
+              ),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      Icon(
+                        Icons.zoom_in,
+                        size: 16,
+                        color: Colors.white.withOpacity(0.9),
+                      ),
+                      const SizedBox(width: 6),
+                      Text(
+                        'Zoom: ${(_panZoomController.zoomScale * 100).toStringAsFixed(0)}%',
+                        style: TextStyle(
+                          color: Colors.white,
+                          fontSize: 13,
+                          fontWeight: FontWeight.w500,
+                        ),
+                      ),
+                    ],
+                  ),
+                  if (_currentMode == EditingMode.liquify) ...[
+                    const SizedBox(height: 8),
+                    Row(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        Icon(
+                          Icons.brush,
+                          size: 16,
+                          color: Colors.white.withOpacity(0.9),
+                        ),
+                        const SizedBox(width: 6),
+                        Text(
+                          'Brush: ${_brushSize.round()}px',
+                          style: TextStyle(
+                            color: Colors.white,
+                            fontSize: 13,
+                            fontWeight: FontWeight.w500,
+                          ),
+                        ),
+                      ],
+                    ),
+                  ],
+                ],
+              ),
+            ),
+          ),
+          // Loading overlay when saving
+          if (_isSaving)
+            Container(
+              color: Colors.black.withOpacity(0.5),
+              child: Center(
+                child: Column(
+                  mainAxisAlignment: MainAxisAlignment.center,
+                  children: [
+                    const CircularProgressIndicator(
+                      valueColor: AlwaysStoppedAnimation<Color>(Colors.white),
+                    ),
+                    const SizedBox(height: 16),
+                    Text(
+                      'Saving image at full resolution...',
+                      style: Theme.of(context).textTheme.bodyLarge?.copyWith(
+                        color: Colors.white,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+        ],
       ),
+    );
+  }
+
+  // Helper method to build mode toggle buttons
+  Widget _buildModeButton(
+    BuildContext context, {
+    required IconData icon,
+    required String label,
+    required bool isActive,
+    required VoidCallback onPressed,
+  }) {
+    return Material(
+      color: Colors.transparent,
+      child: InkWell(
+        onTap: onPressed,
+        borderRadius: BorderRadius.circular(16),
+        child: Container(
+          padding: const EdgeInsets.symmetric(vertical: 14, horizontal: 16),
+          decoration: BoxDecoration(
+            color: isActive
+                ? Theme.of(context).colorScheme.primary
+                : Theme.of(context).colorScheme.surfaceContainerHighest,
+            borderRadius: BorderRadius.circular(16),
+            border: Border.all(
+              color: isActive
+                  ? Theme.of(context).colorScheme.primary
+                  : Theme.of(context).colorScheme.outline.withOpacity(0.2),
+              width: 1.5,
+            ),
+          ),
+          child: Row(
+            mainAxisAlignment: MainAxisAlignment.center,
+            children: [
+              Icon(
+                icon,
+                size: 22,
+                color: isActive
+                    ? Colors.white
+                    : Theme.of(context).colorScheme.onSurface,
+              ),
+              const SizedBox(width: 8),
+              Text(
+                label,
+                style: TextStyle(
+                  fontSize: 15,
+                  fontWeight: isActive ? FontWeight.w600 : FontWeight.w500,
+                  color: isActive
+                      ? Colors.white
+                      : Theme.of(context).colorScheme.onSurface,
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  // Helper method to build control rows with consistent styling
+  Widget _buildControlRow(
+    BuildContext context, {
+    required IconData icon,
+    required String label,
+    required double value,
+    required double min,
+    required double max,
+    required int divisions,
+    required ValueChanged<double> onChanged,
+    String Function(double)? formatValue,
+  }) {
+    final displayValue = formatValue != null 
+        ? formatValue(value) 
+        : value.round().toString();
+    
+    return Row(
+      children: [
+        Container(
+          padding: const EdgeInsets.all(8),
+          decoration: BoxDecoration(
+            color: Theme.of(context).colorScheme.primaryContainer.withOpacity(0.3),
+            borderRadius: BorderRadius.circular(8),
+          ),
+          child: Icon(
+            icon,
+            size: 20,
+            color: Theme.of(context).colorScheme.primary,
+          ),
+        ),
+        const SizedBox(width: 12),
+        Expanded(
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Text(
+                label,
+                style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                  color: Theme.of(context).colorScheme.onSurface.withOpacity(0.7),
+                  fontWeight: FontWeight.w500,
+                ),
+              ),
+              const SizedBox(height: 4),
+              Slider(
+                value: value,
+                min: min,
+                max: max,
+                divisions: divisions,
+                onChanged: onChanged,
+                activeColor: Theme.of(context).colorScheme.primary,
+                inactiveColor: Theme.of(context).colorScheme.surfaceContainerHighest,
+              ),
+            ],
+          ),
+        ),
+        const SizedBox(width: 8),
+        Container(
+          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+          decoration: BoxDecoration(
+            color: Theme.of(context).colorScheme.primaryContainer,
+            borderRadius: BorderRadius.circular(8),
+          ),
+          child: Text(
+            displayValue,
+            style: TextStyle(
+              fontSize: 14,
+              fontWeight: FontWeight.w600,
+              color: Theme.of(context).colorScheme.onPrimaryContainer,
+            ),
+          ),
+        ),
+      ],
     );
   }
 }
